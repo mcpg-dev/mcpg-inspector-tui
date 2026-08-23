@@ -1,6 +1,6 @@
 # mcpg-inspector-tui
 
-The terminal face of [`mcpg-inspector`](../server). Screens, keys, and the
+The terminal face of [`mcpg-inspector`](https://github.com/mcpg-dev/mcpg-inspector). Screens, keys, and the
 port they read through — and nothing about the engine.
 
 Everything displayed arrives via `api::InspectorApi`. Two things implement it:

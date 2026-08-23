@@ -1028,7 +1028,7 @@ r         refresh (re-list every surface, re-read frames)
 a         edit arguments, or the watch list
 f         form / JSON, when a schema describes the arguments
 s         in a form: ask the server what completes this field
-w         write this exchange out as a recording (RFC 0003)
+w         write this exchange out as a recording
 J         the result as it arrived, or as read
 g         on diagnose: what the mcpg gateway behind
           this target says about itself
