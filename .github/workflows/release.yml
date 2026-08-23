@@ -29,6 +29,5 @@ jobs:
   release:
     uses: mcpg-dev/.github/.github/workflows/release.yml@main
     with:
-      tier: product
-      has_image: true
+      tier: lib
     secrets: inherit
