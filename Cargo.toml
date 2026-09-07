@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-inspector-tui"
-version = "0.1.0-beta.21"
+version = "0.1.0-beta.22"
 edition = "2024"
 license = "Apache-2.0"
 description = "The terminal face of mcpg-inspector — screens, keys, and the port they read through"
