@@ -27,6 +27,7 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         Screen::Resources => draw_resources(frame, areas[1], state),
         Screen::Prompts => draw_prompts(frame, areas[1], state),
         Screen::Subs => draw_subs(frame, areas[1], state),
+        Screen::Events => draw_events(frame, areas[1], state),
         Screen::History => draw_history(frame, areas[1], state),
         Screen::Pending => draw_pending(frame, areas[1], state),
         Screen::Diagnose => draw_diagnose(frame, areas[1], state),
@@ -52,11 +53,16 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &AppState) {
         let waiting = screen == Screen::Pending && !state.pending.is_empty();
         // A push that arrived while you were elsewhere is only noticeable if
         // the tab says so.
-        let pushed = screen == Screen::Subs && state.unseen_pushes > 0;
+        let unseen = match screen {
+            Screen::Subs => state.unseen_pushes,
+            Screen::Events => state.unseen_event_frames,
+            _ => 0,
+        };
+        let pushed = unseen > 0;
         let label = if waiting {
             format!("{}({})", screen.title(), state.pending.len())
         } else if pushed {
-            format!("{}({})", screen.title(), state.unseen_pushes)
+            format!("{}({unseen})", screen.title())
         } else {
             screen.title().to_owned()
         };
@@ -226,7 +232,7 @@ fn push_arguments(detail: &mut String, state: &AppState) {
         &state.args
     };
     if fields.is_empty() {
-        detail.push_str("\n\narguments (a to edit, enter to call)");
+        detail.push_str("\n\narguments (a to edit, enter to run)");
         // A caret marks the edit point; without it an empty buffer in edit
         // mode is indistinguishable from one that is not being edited.
         detail.push_str(&format!("\n{args}"));
@@ -236,7 +242,7 @@ fn push_arguments(detail: &mut String, state: &AppState) {
         return;
     }
     if !state.form {
-        detail.push_str("\n\narguments — JSON (f for the form, a to edit, enter to call)");
+        detail.push_str("\n\narguments — JSON (f for the form, a to edit, enter to run)");
         detail.push_str(&format!("\n{args}"));
         if state.editing_args {
             detail.push('▎');
@@ -726,6 +732,107 @@ fn draw_subs(frame: &mut Frame, area: Rect, state: &AppState) {
     );
 }
 
+/// MCP Events: the types on the left; on the right the selected one, its
+/// arguments and the last poll, over the tail of the open stream.
+fn draw_events(frame: &mut Frame, area: Rect, state: &AppState) {
+    if state.events.is_empty() {
+        return frame.render_widget(
+            Paragraph::new(
+                "No event types listed. Connect a target (c), then refresh (r). \
+                 A server without the MCP Events extension lists none.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(bordered("events")),
+            area,
+        );
+    }
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(area);
+
+    let items: Vec<ListItem> = state
+        .events
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let marker = if i == state.selected_event {
+                "▸ "
+            } else {
+                "  "
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(marker),
+                Span::raw(row.name.clone()),
+                Span::styled(
+                    format!("  {}", row.delivery.join(",")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+    frame.render_widget(List::new(items).block(bordered("events")), columns[0]);
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(columns[1]);
+
+    let mut detail = String::new();
+    if let Some(row) = state.events.get(state.selected_event) {
+        detail.push_str(&row.name);
+        detail.push_str("\n\n");
+        detail.push_str(row.description.as_deref().unwrap_or("—"));
+        detail.push_str(&format!("\n\ndelivery: {}", row.delivery.join(", ")));
+        detail.push_str("\nenter opens or closes a stream · p polls once");
+        push_arguments(&mut detail, state);
+        push_result(&mut detail, state, state.entity_result.as_deref(), None);
+    }
+    frame.render_widget(
+        Paragraph::new(detail)
+            .wrap(Wrap { trim: false })
+            .block(bordered("detail")),
+        right[0],
+    );
+
+    let title = match &state.streaming {
+        Some((name, arguments)) => format!("● {name} {arguments} ({})", state.event_frames.len()),
+        None => "stream".to_owned(),
+    };
+    if state.event_frames.is_empty() {
+        return frame.render_widget(
+            Paragraph::new(if state.streaming.is_some() {
+                "Open. Nothing arrived yet."
+            } else {
+                "No stream open. Press enter to open one on the selected type."
+            })
+            .block(bordered(&title)),
+            right[1],
+        );
+    }
+    let capacity = right[1].height.saturating_sub(2) as usize;
+    let start = state.event_frames.len().saturating_sub(capacity);
+    let shown = &state.event_frames[start..];
+    let width = column_width(shown.iter().map(|p| p.method.as_str()));
+    let items: Vec<ListItem> = shown
+        .iter()
+        .map(|row| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{} ", clock(row.ts_ms)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:<width$}", row.method),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(one_line(&row.body)),
+            ]))
+        })
+        .collect();
+    frame.render_widget(List::new(items).block(bordered(&title)), right[1]);
+}
+
 /// The protocol checks, and what they found.
 fn draw_diagnose(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut lines = gateway_lines(state);
@@ -1009,7 +1116,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = area.width.min(64);
-    let height = area.height.min(18);
+    let height = area.height.min(22);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1032,9 +1139,11 @@ w         write this exchange out as a recording
 J         the result as it arrived, or as read
 g         on diagnose: what the mcpg gateway behind
           this target says about itself
+p         on events: poll the selected type once
 enter     run this screen — call a tool, read a
           resource, render a prompt, listen for
-          pushes, run the protocol checks
+          pushes, open an event stream, run the
+          protocol checks
 ?         close this help";
     frame.render_widget(
         Paragraph::new(body)
@@ -1193,6 +1302,7 @@ mod tests {
         assert!(render(&at(Screen::Tools)).contains("Connect a target"));
         assert!(render(&at(Screen::Wire)).contains("No frames yet"));
         assert!(render(&at(Screen::Subs)).contains("No pushes"));
+        assert!(render(&at(Screen::Events)).contains("No event types"));
         assert!(render(&at(Screen::Diagnose)).contains("No report yet"));
     }
 
@@ -1310,6 +1420,41 @@ mod tests {
             screen.contains("notifications/subscriptions/acknowledged {"),
             "the longest method must not run into the body: {screen}"
         );
+    }
+
+    #[test]
+    fn events_screen_lists_types_and_tails_the_open_stream() {
+        let live = AppState {
+            events: vec![crate::state::EventRow {
+                name: "order.created".into(),
+                description: Some("a new order".into()),
+                delivery: vec!["poll".into(), "push".into()],
+                input_schema: None,
+            }],
+            streaming: Some(("order.created".into(), "{}".into())),
+            event_frames: vec![PushRow {
+                ts_ms: 3_661_000,
+                method: "notifications/events/event".into(),
+                body: "{\"params\":{\"eventId\":\"e1\"}}".into(),
+            }],
+            ..at(Screen::Events)
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &live)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let screen = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("order.created  poll,push"), "{screen}");
+        assert!(screen.contains("delivery: poll, push"), "{screen}");
+        assert!(screen.contains("● order.created {} (1)"), "{screen}");
+        assert!(screen.contains("notifications/events/event"), "{screen}");
+        assert!(screen.contains("01:01:01"), "{screen}");
     }
 
     /// A skipped check must not read as a failure — asserting a sessionful

@@ -17,6 +17,7 @@ pub enum Screen {
     Resources,
     Prompts,
     Subs,
+    Events,
     History,
     Pending,
     Diagnose,
@@ -31,6 +32,7 @@ impl Screen {
             Self::Resources => "resources",
             Self::Prompts => "prompts",
             Self::Subs => "subs",
+            Self::Events => "events",
             Self::History => "history",
             Self::Pending => "pending",
             Self::Diagnose => "diagnose",
@@ -42,12 +44,13 @@ impl Screen {
     /// used to be spelled four times — a `next`, a `previous`, a modulo and
     /// two index maps — which is four chances for a new screen to be
     /// reachable one way and not the other.
-    pub const ALL: [Screen; 9] = [
+    pub const ALL: [Screen; 10] = [
         Screen::Targets,
         Screen::Tools,
         Screen::Resources,
         Screen::Prompts,
         Screen::Subs,
+        Screen::Events,
         Screen::History,
         Screen::Pending,
         Screen::Diagnose,
@@ -110,6 +113,18 @@ impl PromptRow {
             .map(|argument| argument.name.as_str())
             .collect()
     }
+}
+
+/// One MCP Events type the server offers.
+#[derive(Clone, Debug)]
+pub struct EventRow {
+    pub name: String,
+    pub description: Option<String>,
+    /// `poll`, `push`, `webhook`: the ways it can be delivered.
+    pub delivery: Vec<String>,
+    /// What a subscription's arguments must look like; the form is built
+    /// from this.
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// One notification a subscribed server pushed.
@@ -175,6 +190,11 @@ pub enum Action {
     GetPrompt,
     /// Open the push stream, or close the one that is open.
     ToggleSubscription,
+    /// Open an `events/stream` on the selected event type with the current
+    /// arguments, or close the one that is open.
+    ToggleEventStream,
+    /// Poll the selected event type once with the current arguments.
+    PollEvents,
     /// Run the protocol checks against the selected target.
     Diagnose,
     /// Read what the mcpg gateway behind the selected target says about
@@ -209,6 +229,15 @@ pub struct AppState {
     pub pushes: Vec<PushRow>,
     /// A push stream is open on the selected target.
     pub subscribed: bool,
+    pub events: Vec<EventRow>,
+    pub selected_event: usize,
+    /// Frames of the open event stream, oldest first.
+    pub event_frames: Vec<PushRow>,
+    /// The event type a stream is open on, and the arguments it was opened
+    /// with: what is arriving, not what the cursor is on.
+    pub streaming: Option<(String, String)>,
+    /// Event frames that arrived while the events screen was not on show.
+    pub unseen_event_frames: usize,
     /// Report from the last protocol run, if one has been run.
     pub checks: Option<CheckSummary>,
     pub gateway: Option<GatewayView>,
@@ -418,12 +447,14 @@ impl AppState {
             'c' => Action::Connect,
             'd' => Action::Disconnect,
             'r' => Action::Refresh,
+            'p' if self.screen() == Screen::Events => self.gate_op(Action::PollEvents),
             'a' if matches!(
                 self.screen(),
                 Screen::Tools
                     | Screen::Resources
                     | Screen::Prompts
                     | Screen::Subs
+                    | Screen::Events
                     | Screen::Pending
             ) =>
             {
@@ -443,6 +474,7 @@ impl AppState {
                 Screen::Resources => self.gate_op(Action::ReadResource),
                 Screen::Prompts => self.gate_op(Action::GetPrompt),
                 Screen::Subs => Action::ToggleSubscription,
+                Screen::Events => Action::ToggleEventStream,
                 Screen::History => Action::ReplayHistory,
                 Screen::Pending => Action::Answer,
                 Screen::Diagnose => Action::Diagnose,
@@ -560,15 +592,20 @@ impl AppState {
         if self.screen() != Screen::Subs {
             self.unseen_pushes += 1;
         }
-        self.pushes.push(PushRow {
-            ts_ms,
-            method,
-            body: frame.to_string(),
-        });
-        if self.pushes.len() > PUSH_CAP {
-            let overflow = self.pushes.len() - PUSH_CAP;
-            self.pushes.drain(..overflow);
+        push_capped(&mut self.pushes, ts_ms, method, frame);
+    }
+
+    /// Record one frame of the open event stream, newest last.
+    pub fn record_event_frame(&mut self, ts_ms: u64, frame: &serde_json::Value) {
+        let method = frame
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("?")
+            .to_owned();
+        if self.screen() != Screen::Events {
+            self.unseen_event_frames += 1;
         }
+        push_capped(&mut self.event_frames, ts_ms, method, frame);
     }
 
     /// Take the queue as the responder reports it.
@@ -618,6 +655,10 @@ impl AppState {
                 .get(self.selected_resource)
                 .filter(|row| row.is_template)
                 .and_then(|row| crate::schema::schema_from_uri_template(&row.uri)),
+            Screen::Events => self
+                .events
+                .get(self.selected_event)
+                .and_then(|row| row.input_schema.clone()),
             _ => None,
         }
     }
@@ -706,8 +747,10 @@ impl AppState {
     }
 
     fn mark_pushes_seen(&mut self) {
-        if self.screen() == Screen::Subs {
-            self.unseen_pushes = 0;
+        match self.screen() {
+            Screen::Subs => self.unseen_pushes = 0,
+            Screen::Events => self.unseen_event_frames = 0,
+            _ => {}
         }
     }
 
@@ -785,6 +828,7 @@ impl AppState {
             Screen::Tools => (self.tools.len(), &mut self.selected_tool),
             Screen::Resources => (self.resources.len(), &mut self.selected_resource),
             Screen::Prompts => (self.prompts.len(), &mut self.selected_prompt),
+            Screen::Events => (self.events.len(), &mut self.selected_event),
             Screen::Pending => (self.pending.len(), &mut self.selected_pending),
             Screen::History => (self.history.len(), &mut self.selected_history),
             // These tails follow a stream and the report is short enough to
@@ -798,6 +842,19 @@ impl AppState {
         let next = (*index as isize + delta).rem_euclid(len as isize);
         *index = next as usize;
         self.reseed_args();
+    }
+}
+
+/// Append one frame to a tail, dropping the oldest beyond [`PUSH_CAP`].
+fn push_capped(rows: &mut Vec<PushRow>, ts_ms: u64, method: String, frame: &serde_json::Value) {
+    rows.push(PushRow {
+        ts_ms,
+        method,
+        body: frame.to_string(),
+    });
+    if rows.len() > PUSH_CAP {
+        let overflow = rows.len() - PUSH_CAP;
+        rows.drain(..overflow);
     }
 }
 
@@ -847,6 +904,10 @@ mod tests {
         assert_eq!(
             on_screen(Screen::Subs).on_key('\r'),
             Action::ToggleSubscription
+        );
+        assert_eq!(
+            on_screen(Screen::Events).on_key('\r'),
+            Action::ToggleEventStream
         );
         assert_eq!(on_screen(Screen::Diagnose).on_key('\r'), Action::Diagnose);
         // Nothing to run on a list of targets or a tail of frames.
@@ -1745,6 +1806,68 @@ mod tests {
 
     /// A push that lands while you are elsewhere is only noticeable if the
     /// tab says so — and arriving at the screen is what clears it.
+    fn order_events() -> Vec<EventRow> {
+        vec![
+            EventRow {
+                name: "order.created".into(),
+                description: None,
+                delivery: vec!["poll".into(), "push".into()],
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "shop": { "type": "string" } },
+                    "required": ["shop"]
+                })),
+            },
+            EventRow {
+                name: "order.shipped".into(),
+                description: None,
+                delivery: vec!["webhook".into()],
+                input_schema: None,
+            },
+        ]
+    }
+
+    /// The events screen polls on `p`, one operation at a time, and nowhere
+    /// else does `p` mean anything.
+    #[test]
+    fn p_polls_the_selected_event_type_only_on_the_events_screen() {
+        let mut app = on_screen(Screen::Events);
+        app.events = order_events();
+        assert_eq!(app.on_key('p'), Action::PollEvents);
+        app.busy = true;
+        assert_eq!(app.on_key('p'), Action::None);
+        assert_eq!(on_screen(Screen::Tools).on_key('p'), Action::None);
+    }
+
+    /// An event type's `inputSchema` is what the arguments form is built
+    /// from, so a subscription is filled field by field like a tool call.
+    #[test]
+    fn an_event_types_input_schema_drives_the_form() {
+        let mut app = on_screen(Screen::Events);
+        app.events = order_events();
+        let fields = app.fields();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "shop");
+
+        app.on_key('j');
+        assert_eq!(app.selected_event, 1);
+        assert!(app.fields().is_empty(), "no schema, no form");
+    }
+
+    #[test]
+    fn event_frames_arriving_elsewhere_are_counted_until_seen() {
+        let mut app = on_screen(Screen::Tools);
+        let frame = serde_json::json!({ "method": "notifications/events/event" });
+        app.record_event_frame(1, &frame);
+        assert_eq!(app.unseen_event_frames, 1);
+        assert_eq!(app.unseen_pushes, 0, "the two tails count apart");
+        app.go_to(Screen::Events);
+        assert_eq!(app.unseen_event_frames, 0);
+        app.record_event_frame(2, &frame);
+        assert_eq!(app.event_frames.len(), 2);
+        assert_eq!(app.event_frames[1].method, "notifications/events/event");
+    }
+
     #[test]
     fn pushes_arriving_elsewhere_are_counted_until_seen() {
         let mut app = on_screen(Screen::Tools);

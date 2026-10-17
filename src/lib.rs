@@ -131,6 +131,13 @@ async fn event_loop(
     // for the whole loop so the channel never closes between subscriptions.
     let (push_tx, mut push_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(256);
     let mut subscription: Option<Subscription> = None;
+    // An event stream's frames, tagged with the stream they came from: `None`
+    // is that stream ending, and a stream already replaced must not clear
+    // the one that replaced it.
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel::<(u64, Option<serde_json::Value>)>(256);
+    let mut event_stream: Option<Subscription> = None;
+    let mut stream_generation: u64 = 0;
     // Operations run OFF this loop and report back here. They have to: a
     // server may answer a call by asking the client something, and under the
     // interactive responder that parks until a human answers. Awaiting the
@@ -152,6 +159,21 @@ async fn event_loop(
                 // it is not; nothing to record rather than an EOF.
                 if let Some(frame) = frame {
                     app.record_push(now_ms(), &frame);
+                }
+                continue;
+            }
+            fed = event_rx.recv() => {
+                match fed {
+                    Some((generation, Some(frame))) if generation == stream_generation => {
+                        app.record_event_frame(now_ms(), &frame);
+                    }
+                    Some((generation, None)) if generation == stream_generation => {
+                        event_stream = None;
+                        if let Some((name, _)) = app.streaming.take() {
+                            app.status = format!("the server closed the {name} stream");
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -244,7 +266,83 @@ async fn event_loop(
                 // that no longer exists.
                 subscription = None;
                 app.subscribed = false;
+                event_stream = None;
+                app.streaming = None;
+                app.events.clear();
                 sync_targets(&**api, app).await;
+            }
+            Action::ToggleEventStream => {
+                if event_stream.take().is_some() {
+                    stream_generation += 1;
+                    if let Some((name, _)) = app.streaming.take() {
+                        app.status = format!("closed the {name} stream");
+                    }
+                    continue;
+                }
+                let Some(name) = app.events.get(app.selected_event).map(|e| e.name.clone()) else {
+                    app.status = "no event type selected".to_owned();
+                    continue;
+                };
+                let Some(id) = selected_id(app) else {
+                    app.status = "no target selected".to_owned();
+                    continue;
+                };
+                let Some(arguments) = arguments_of(app) else {
+                    continue;
+                };
+                app.busy = true;
+                app.status = format!("opening the {name} stream…");
+                let _ = terminal.draw(|frame| draw::draw(frame, app));
+                match api.event_stream(&id, &name, &arguments).await {
+                    Ok(mut frames) => {
+                        stream_generation += 1;
+                        let generation = stream_generation;
+                        let tx = event_tx.clone();
+                        event_stream = Some(Subscription(tokio::spawn(async move {
+                            while let Some(frame) = frames.next().await {
+                                if tx.send((generation, Some(frame))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            let _ = tx.send((generation, None)).await;
+                        })));
+                        app.event_frames.clear();
+                        app.streaming = Some((name.clone(), arguments.to_string()));
+                        app.status = format!("streaming {name} — enter to close");
+                    }
+                    Err(e) => app.status = format!("events/stream failed: {e}"),
+                }
+                app.busy = false;
+            }
+            Action::PollEvents => {
+                let Some(name) = app.events.get(app.selected_event).map(|e| e.name.clone()) else {
+                    app.status = "no event type selected".to_owned();
+                    continue;
+                };
+                let Some(id) = selected_id(app) else {
+                    app.status = "no target selected".to_owned();
+                    continue;
+                };
+                let Some(arguments) = arguments_of(app) else {
+                    continue;
+                };
+                app.busy = true;
+                app.status = format!("polling {name}…");
+                let tx = op_tx.clone();
+                let api = Arc::clone(api);
+                let started_ms = now_ms();
+                tokio::spawn(async move {
+                    let result = api.poll_events(&id, &name, &arguments).await;
+                    let about = OpSubject {
+                        verb: "polled",
+                        subject: name.clone(),
+                        args: arguments.to_string(),
+                        started_ms,
+                    };
+                    let _ = tx
+                        .send(OpOutcome::polled(format!("polled {name}"), about, result))
+                        .await;
+                });
             }
             Action::ToggleSubscription => {
                 if subscription.is_some() {
@@ -375,6 +473,10 @@ async fn event_loop(
                         state::Screen::Prompts,
                         app.prompts.iter().position(|p| p.name == row.subject),
                     ),
+                    "polled" => (
+                        state::Screen::Events,
+                        app.events.iter().position(|e| e.name == row.subject),
+                    ),
                     _ => (
                         state::Screen::Resources,
                         app.resources.iter().position(|r| r.uri == row.subject),
@@ -384,6 +486,7 @@ async fn event_loop(
                 match (screen, found) {
                     (state::Screen::Tools, Some(i)) => app.selected_tool = i,
                     (state::Screen::Prompts, Some(i)) => app.selected_prompt = i,
+                    (state::Screen::Events, Some(i)) => app.selected_event = i,
                     (state::Screen::Resources, Some(i)) => app.selected_resource = i,
                     _ => {}
                 }
@@ -653,6 +756,10 @@ impl OpOutcome {
         Self::new(ok, "render failed", ResultSlot::Entity, about, result)
     }
 
+    fn polled(ok: String, about: OpSubject, result: OpResult) -> Self {
+        Self::new(ok, "poll failed", ResultSlot::Entity, about, result)
+    }
+
     /// The history row this outcome is, whichever way it went. A failure is
     /// the more interesting half of a history, so it is recorded the same way
     /// a success is.
@@ -694,6 +801,26 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// The argument buffer as a JSON object, or a status line saying why not.
+fn arguments_of(app: &mut AppState) -> Option<serde_json::Value> {
+    let text = if app.args.trim().is_empty() {
+        "{}"
+    } else {
+        &app.args
+    };
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value @ serde_json::Value::Object(_)) => Some(value),
+        Ok(_) => {
+            app.status = "arguments must be a JSON object — press a to edit".to_owned();
+            None
+        }
+        Err(e) => {
+            app.status = format!("arguments are not valid JSON: {e} — press a to edit");
+            None
+        }
+    }
+}
+
 /// The id of whatever is selected, or nothing when the list is empty.
 fn selected_id(app: &AppState) -> Option<String> {
     app.selected_target().map(|target| target.id.clone())
@@ -712,6 +839,10 @@ async fn refresh_target(api: &dyn InspectorApi, id: &str, app: &mut AppState) {
     app.tools = catalog.tools;
     app.resources = catalog.resources;
     app.prompts = catalog.prompts;
+    app.events = catalog.events;
+    if app.selected_event >= app.events.len() {
+        app.selected_event = 0;
+    }
     if app.selected_tool >= app.tools.len() {
         app.selected_tool = 0;
     }

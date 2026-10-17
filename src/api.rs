@@ -14,7 +14,7 @@ use futures::Stream;
 use serde_json::{Value, json};
 use std::pin::Pin;
 
-use super::state::{PendingRow, PromptRow, ResourceRow, TargetRow, ToolRow};
+use super::state::{EventRow, PendingRow, PromptRow, ResourceRow, TargetRow, ToolRow};
 use super::view::{CheckSummary, GatewayView, SessionView, WireRow};
 
 /// Everything one target advertises, plus what could not be read.
@@ -28,6 +28,9 @@ pub struct Catalog {
     pub tools: Vec<ToolRow>,
     pub resources: Vec<ResourceRow>,
     pub prompts: Vec<PromptRow>,
+    /// MCP Events types. Most servers do not offer the extension, so a
+    /// failed `events/list` reads as none rather than as an error.
+    pub events: Vec<EventRow>,
     /// Per-surface failures, for the status line. Empty is not the same as
     /// "there are none" and must not read that way.
     pub errors: Vec<String>,
@@ -59,6 +62,11 @@ pub trait InspectorApi: Send + Sync {
         answer: Result<Value, String>,
     ) -> Result<(), String>;
     async fn subscribe(&self, id: &str, uris: &[String]) -> Result<PushStream, String>;
+    /// One `events/poll`, its result as the server sent it.
+    async fn poll_events(&self, id: &str, name: &str, args: &Value) -> Result<Value, String>;
+    /// An `events/stream`, one JSON-RPC message per item, for as long as the
+    /// caller holds it.
+    async fn event_stream(&self, id: &str, name: &str, args: &Value) -> Result<PushStream, String>;
     /// This target's exchange as a recording — the text of the file, not a
     /// path, because whoever asked decides where it goes.
     async fn recording(&self, id: &str) -> Result<String, String>;
@@ -239,6 +247,9 @@ impl InspectorApi for RemoteApi {
             Ok(body) => catalog.prompts = parse_prompts(&body),
             Err(e) => catalog.errors.push(format!("prompts/list: {e}")),
         }
+        if let Ok(body) = self.op(id, "events.list", &json!({})).await {
+            catalog.events = parse_events(&body);
+        }
         catalog
     }
 
@@ -357,6 +368,37 @@ impl InspectorApi for RemoteApi {
             .map_err(|e| e.to_string())?;
         if !response.status().is_success() {
             return Err(format!("subscribe failed: HTTP {}", response.status()));
+        }
+        Ok(Box::pin(sse_frames(response)))
+    }
+
+    async fn poll_events(&self, id: &str, name: &str, args: &Value) -> Result<Value, String> {
+        self.op(
+            id,
+            "events.poll",
+            &json!({ "name": name, "arguments": args }),
+        )
+        .await
+    }
+
+    async fn event_stream(&self, id: &str, name: &str, args: &Value) -> Result<PushStream, String> {
+        let url = format!(
+            "{}/api/v1/targets/{}/event-streams?name={}&arguments={}",
+            self.base,
+            encode(id),
+            percent_encode(name),
+            percent_encode(&args.to_string())
+        );
+        let response = self
+            .auth(self.http.get(url))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(Self::body(response)
+                .await
+                .err()
+                .unwrap_or_else(|| "event stream refused".to_owned()));
         }
         Ok(Box::pin(sse_frames(response)))
     }
@@ -560,6 +602,33 @@ fn parse_prompts(body: &Value) -> Vec<PromptRow> {
                             .collect()
                     })
                     .unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn parse_events(body: &Value) -> Vec<EventRow> {
+    array(body, "events")
+        .iter()
+        .filter_map(|event| {
+            Some(EventRow {
+                name: event.get("name")?.as_str()?.to_owned(),
+                description: event
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                delivery: event
+                    .get("delivery")
+                    .and_then(Value::as_array)
+                    .map(|modes| {
+                        modes
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                input_schema: event.get("inputSchema").cloned(),
             })
         })
         .collect()
