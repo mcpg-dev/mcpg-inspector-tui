@@ -541,9 +541,7 @@ fn draw_pending(frame: &mut Frame, area: Rect, state: &AppState) {
     let mut detail = String::new();
     if let Some(row) = state.pending.get(state.selected_pending) {
         detail.push_str(&row.method);
-        detail.push_str("  (");
-        detail.push_str(&row.regime);
-        detail.push_str(" wire)\n\nthe server sent\n");
+        detail.push_str("\n\nthe server sent\n");
         detail.push_str(&row.params);
         detail.push_str("\n\nyour answer (a to edit, enter to send, x to decline)\n");
         detail.push_str(&state.answer);
@@ -845,8 +843,7 @@ fn draw_diagnose(frame: &mut Frame, area: Rect, state: &AppState) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "The checks assert transport rules a client call would paper over, so they build \
-             their own requests. Checks that do not apply to the negotiated revision are \
-             skipped, not failed.",
+             their own requests.",
             Style::default().fg(Color::DarkGray),
         )));
         return frame.render_widget(
@@ -878,11 +875,6 @@ fn draw_diagnose(frame: &mut Frame, area: Rect, state: &AppState) {
                     Color::Red
                 }),
             ),
-            Span::raw(" · "),
-            Span::styled(
-                format!("{} skipped", report.skipped),
-                Style::default().fg(Color::DarkGray),
-            ),
         ]),
         Line::from(""),
     ]);
@@ -891,7 +883,6 @@ fn draw_diagnose(frame: &mut Frame, area: Rect, state: &AppState) {
         let (mark, colour) = match check.outcome {
             Outcome::Pass => ("✓", Color::Green),
             Outcome::Fail => ("✗", Color::Red),
-            Outcome::Skip => ("–", Color::DarkGray),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{mark} "), Style::default().fg(colour)),
@@ -1457,17 +1448,15 @@ mod tests {
         assert!(screen.contains("01:01:01"), "{screen}");
     }
 
-    /// A skipped check must not read as a failure — asserting a sessionful
-    /// rule against a stateless server is a false failure, and the screen is
-    /// where that distinction has to survive.
+    /// Each check reads as passed or failed at a glance, with the counts and
+    /// the revision the checks ran against above them.
     #[test]
-    fn diagnose_screen_separates_failed_from_skipped() {
+    fn diagnose_screen_separates_passed_from_failed() {
         let state = AppState {
             checks: Some(CheckSummary {
                 protocol_version: "2026-07-28".into(),
-                passed: 1,
+                passed: 2,
                 failed: 1,
-                skipped: 1,
                 checks: vec![
                     CheckRow {
                         id: "post-accept".into(),
@@ -1480,12 +1469,6 @@ mod tests {
                         description: "a foreign Origin is refused".into(),
                         outcome: Outcome::Fail,
                         detail: Some("answered 200".into()),
-                    },
-                    CheckRow {
-                        id: "session-header".into(),
-                        description: "Mcp-Session-Id is returned".into(),
-                        outcome: Outcome::Skip,
-                        detail: Some("sessionful only".into()),
                     },
                     // Longer than any fixed column would allow; a real check
                     // id runs to this length.
@@ -1500,12 +1483,11 @@ mod tests {
             ..at(Screen::Diagnose)
         };
         let screen = render(&state);
-        assert!(screen.contains("1 passed"), "{screen}");
+        assert!(screen.contains("wire 2026-07-28"), "{screen}");
+        assert!(screen.contains("2 passed"), "{screen}");
         assert!(screen.contains("1 failed"), "{screen}");
-        assert!(screen.contains("1 skipped"), "{screen}");
         assert!(screen.contains("✓ post-accept"), "{screen}");
         assert!(screen.contains("✗ origin-rejected"), "{screen}");
-        assert!(screen.contains("– session-header"), "{screen}");
         assert!(screen.contains("answered 200"), "detail: {screen}");
         // The id column is sized from its contents: the longest id must not
         // run into the description with no space between them.
@@ -1530,7 +1512,6 @@ mod tests {
             id: 1,
             method: "sampling/createMessage".into(),
             params: "{\n  \"maxTokens\": 64\n}".into(),
-            regime: "sessionful".into(),
         }];
         let state = AppState {
             pending: waiting.clone(),
@@ -1539,7 +1520,6 @@ mod tests {
         };
         let screen = render(&state);
         assert!(screen.contains("sampling/createMessage"), "{screen}");
-        assert!(screen.contains("sessionful wire"), "{screen}");
         assert!(screen.contains("maxTokens"), "what was asked: {screen}");
         assert!(screen.contains("x to decline"), "{screen}");
         assert!(screen.contains("enter answer"), "footer: {screen}");

@@ -325,11 +325,6 @@ impl InspectorApi for RemoteApi {
                                 request.get("params").unwrap_or(&Value::Null),
                             )
                             .unwrap_or_default(),
-                            regime: request
-                                .get("regime")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                                .to_owned(),
                         })
                     })
                     .collect()

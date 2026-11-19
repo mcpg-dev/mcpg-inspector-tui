@@ -167,8 +167,6 @@ pub struct PendingRow {
     pub method: String,
     /// What the server sent, pretty-printed.
     pub params: String,
-    /// Which regime produced it; the two differ on timeout and cancellation.
-    pub regime: String,
 }
 
 /// What the event loop should do after a keypress. Keeping the intent
@@ -1275,7 +1273,6 @@ mod tests {
             id,
             method: method.into(),
             params: "{}".into(),
-            regime: "sessionful".into(),
         }
     }
 

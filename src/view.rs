@@ -43,9 +43,6 @@ impl WireRow {
 pub enum Outcome {
     Pass,
     Fail,
-    /// Not applicable to the negotiated wire — which is not a failure, and
-    /// the screen has to keep the difference.
-    Skip,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,7 +59,6 @@ pub struct CheckSummary {
     pub protocol_version: String,
     pub passed: usize,
     pub failed: usize,
-    pub skipped: usize,
     pub checks: Vec<CheckRow>,
 }
 
@@ -135,13 +131,13 @@ mod tests {
         assert!(frame.is_sent());
 
         let report: CheckSummary = serde_json::from_str(
-            r#"{"protocol_version":"2026-07-28","passed":1,"failed":0,"skipped":1,
+            r#"{"protocol_version":"2026-07-28","passed":1,"failed":1,
                 "checks":[{"id":"a","description":"d","outcome":"pass"},
-                          {"id":"b","description":"e","outcome":"skip","detail":"why"}]}"#,
+                          {"id":"b","description":"e","outcome":"fail","detail":"why"}]}"#,
         )
         .expect("report");
         assert_eq!(report.checks[0].outcome, Outcome::Pass);
-        assert_eq!(report.checks[1].outcome, Outcome::Skip);
+        assert_eq!(report.checks[1].outcome, Outcome::Fail);
         assert_eq!(report.checks[1].detail.as_deref(), Some("why"));
     }
 }

@@ -396,10 +396,7 @@ async fn event_loop(
                 let _ = terminal.draw(|frame| draw::draw(frame, app));
                 match api.checks(&id).await {
                     Ok(report) => {
-                        app.status = format!(
-                            "{} passed · {} failed · {} skipped",
-                            report.passed, report.failed, report.skipped
-                        );
+                        app.status = format!("{} passed · {} failed", report.passed, report.failed);
                         app.checks = Some(report);
                     }
                     Err(e) => {
